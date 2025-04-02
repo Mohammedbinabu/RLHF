@@ -3,6 +3,8 @@ from trl import GRPOConfig, GRPOTrainer
 from vllm import SamplingParams
 from unsloth import FastLanguageModel
 import random
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ------------------------
 # 1. LOAD YOUR DATASET
@@ -115,32 +117,36 @@ data = [
     }
 ]
 
-def reward_function(prompts, responses, reward_dict):
-    """
-    Looks up exact prompt-response pairs in your precomputed reward dictionary
-    
-    Args:
-        prompts: List of input prompts
-        responses: List of generated responses
-        reward_dict: Dictionary mapping (prompt, response) tuples to rewards
-        
-    Returns:
-        List of rewards for each prompt-response pair
-    """
+similarity_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# 3. Create Ground Truth Lookup
+gt_lookup = {item['prompt']: {'answer': item['response'], 'reward': item['reward_score']} 
+             for item in data}
+
+# 4. Enhanced Reward Function
+def rf(prompts: list, completions: list, **kwargs) -> list:
     rewards = []
-    for prompt, response in zip(prompts, responses):
-        key = (prompt.strip(), response.strip())
-        reward = reward_dict.get(key, 0.5)  # Default to neutral reward if not found
-        rewards.append(reward)
-        print("rewards: ",reward)
-        print("key:",key)
+    for prompt, completion in zip(prompts, completions):
+        if not completion.strip():  # Check if completion is empty/whitespace
+            rewards.append(-1.0)   # Strong penalty for empty responses
+            continue
+        
+        gt_data = gt_lookup.get(prompt)
+        if gt_data:
+            embeddings = similarity_model.encode([completion, gt_data['answer']])
+            
+            # Check for NaN/inf in embeddings (safety)
+            if np.isnan(embeddings).any() or np.isinf(embeddings).any():
+                rewards.append(-1.0)
+                continue
+            
+            similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+            scaled_reward = similarity
+            rewards.append(float(scaled_reward))
+        else:
+            rewards.append(0.01)
+    
     return rewards
-
-reward_dict = {(row['prompt'], row['response']): row['reward_score'] 
-              for row in data}
-
-reward_func = lambda prompts, responses: reward_function(prompts, responses, reward_dict)
-
 
 # def format_example(example):
 #     answer = "\n".join(f"{item}" for item in example["response"].split('\n'))
@@ -201,10 +207,10 @@ reward_func = lambda prompts, responses: reward_function(prompts, responses, rew
 # # 3. TRAINING CONFIGURATION5
 # # ------------------------
 max_seq_length = 1024
-max_prompt_length = 512
+max_prompt_length = 256
 
 training_args = GRPOConfig(
-    learning_rate=5e-5,
+    learning_rate=1e-3,
     weight_decay=0.1,
     warmup_ratio=0.1,
     lr_scheduler_type="cosine",
@@ -217,7 +223,9 @@ training_args = GRPOConfig(
     max_completion_length=max_seq_length - max_prompt_length,
     max_steps=50,
     save_steps=25,
-    max_grad_norm=0.3,
+    #kl_coeff=0.1,
+    #use_advantage=True,
+    max_grad_norm=0.1,
     report_to="none",
     output_dir="deepseek-grpo-output",
 )
@@ -251,7 +259,7 @@ trainer = GRPOTrainer(
     #generations_per_prompt=1,
     model=model,
     processing_class=tokenizer,
-    reward_funcs=reward_func,
+    reward_funcs=[rf],
     args=training_args,
     train_dataset=data,
 )
@@ -274,7 +282,7 @@ trainer = GRPOTrainer(
 trainer.train()
 
 # Save LoRA adapters
-model.save_lora("grpo_saved_lora")
+model.save_pretrained("grpo_saved_lora")
 
 # # ------------------------
 # # 5. INFERENCE (DIRECT PROMPT)
